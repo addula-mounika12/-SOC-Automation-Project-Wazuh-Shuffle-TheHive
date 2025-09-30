@@ -1,0 +1,1 @@
+# -SOC-Automation-Project-Wazuh-Shuffle-TheHive
