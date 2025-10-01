@@ -68,3 +68,188 @@ sudo ufw allow 1514/udp   # agent events
 ![Wazuh manager](https://github.com/addula-mounika12/-SOC-Automation-Project-Wazuh-Shuffle-TheHive/blob/85862c8cdf55aeb576f4b2293579a2f62066a391/assets/Screenshot%202025-09-27%20171436.png)
 ---
 
+## 🖥️ Step 3: Sysmon Ingestion + Mimikatz Detection  
+
+Now configuring the Windows 11 virtual machine and start sending the Sysmon telemetry over to the Wazuh manager, then I am creating the custom detection rule looking for mimikatz activity.
+
+### Configure Windows 11 VM and install Sysmon & Wazuh Agent  
+On the Windows 11 VM I installed Sysmon (community config) and the Wazuh Agent. I ran the Wazuh agent installer in an elevated PowerShell so the agent auto-registered with the Wazuh manager.
+
+PowerShell (Administrator) example (run on Windows 11 VM):
+powershell
+ install Sysmon with community config (example)
+.\Sysmon64.exe -i .\sysmonconfig-export.xml -accepteula
+
+### install Wazuh agent 
+(replace <one-liner> with the command you copied from the dashboard)
+powershell -ExecutionPolicy Bypass -Command "<one-liner-from-wazuh-dashboard>"
+Backup ossec.conf on Wazuh manager
+On the Wazuh manager I created a timestamped backup of ossec.conf before editing.
+
+sudo cp /var/ossec/etc/ossec.conf /var/ossec/etc/ossec.conf
+ls -l /var/ossec/etc/ossec.conf*
+### Add Sysmon EventChannel ingestion to ossec.conf
+I opened /var/ossec/etc/ossec.conf and added a localfile block to collect the Sysmon EventChannel.
+
+Edit on Wazuh manager:
+
+sudo nano /var/ossec/etc/ossec.conf
+
+
+Insert inside the <localfile> / log analysis section:
+![screenshot](https://github.com/addula-mounika12/-SOC-Automation-Project-Wazuh-Shuffle-TheHive/blob/591300e55a0c3c6fb807cccfa0c5c75cdb91214f/assets/Screenshot%202025-09-27%20172349.png)
+
+### Confirm Sysmon events appear in Wazuh Explorer
+I verified the Windows endpoint is sending Sysmon events and that they are visible in Wazuh Explorer / archives.
+
+### Generate test Mimikatz telemetry on Windows VM
+I downloaded mimikatz_trunk.zip from GitHub (lab only), extracted it, and executed mimikatz.exe in an elevated PowerShell to produce Sysmon telemetry.
+
+
+### No alerts created a custom local rule
+When no alert appeared, I created (or updated) /var/ossec/etc/rules/local_rules.xml with a rule matching the observed Sysmon fields (Image/CommandLine).
+I created /var/ossec/etc/rules/local_rules.xml with a PCRE/regex that matches mimikatz.exe.
+
+![screenshot](https://github.com/addula-mounika12/-SOC-Automation-Project-Wazuh-Shuffle-TheHive/blob/e99bd7a9a623872a80f992999cce5878ae935efb/assets/image.png)
+
+### Restart Wazuh manager and re-run Mimikatz
+I restarted the manager, then re-executed mimikatz.exe on the Windows VM to trigger the rule.
+
+![screenshot](https://github.com/addula-mounika12/-SOC-Automation-Project-Wazuh-Shuffle-TheHive/blob/c8f810f2d14b67594691c557f77de4d09707aa8a/assets/Screenshot%202025-09-28%20103313.png)
+
+### Confirm alert in Wazuh Alerts
+After the re-run, the local rule matched and an alert appeared in Wazuh Alerts titled "Mimikatz usage detected". I verified alert details on the manager.
+![screenshot](https://github.com/addula-mounika12/-SOC-Automation-Project-Wazuh-Shuffle-TheHive/blob/0674cd3a6957f1c4523f7ae02ef60bd553cad251/assets/Screenshot%202025-09-27%20180202.png)
+
+---
+
+## 🖥️Step 4 & Step 5: Shuffle.io automation (Webhook → SHA256 → VirusTotal → TheHive)
+
+**Two main steps** (git friendly):  
+Build the Shuffle workflow and node configurations. 🧩  
+ Test the workflow, troubleshoot VT "resource not found", connect TheHive, and capture screenshots. 🔎✅
+
+## Step 4  Build the Shuffle workflow (Webhook listener + SHA256 extractor + VT + TheHive) 🧩
+
+###  Create a webhook trigger node
+- **Name:** `Webhook-Alert`  
+- **Method:** POST  
+- **Path / URL:** Shuffle will give you a public webhook URL (e.g. `https://<shuffle-host>/webhook/<id>`)  
+- **Purpose:** receive Wazuh alert JSON when rule id `100002` is fired.
+
+> Example webhook payload snippet (Wazuh JSON):
+json
+{
+  "rule_id": "100002",
+  "title": "Mimikatz Usage Detected",
+  "text": {
+    "win": {
+      "system": {...},
+      "eventdata": {
+         "hashes": "SHA256=61c0810a23580cf492a6ba4f7654566b...;MD5=..."
+      }
+    }
+  },
+  "_all_fields": {...}
+}
+Save this snippet for testing in the Regex node.
+
+![Screenshot](https://github.com/addula-mounika12/-SOC-Automation-Project-Wazuh-Shuffle-TheHive/blob/bfbfeacf8c969aa5d8ad7cca89fefc9dfbe63c90/assets/image.png)
+
+### Add a Regex capture group node (extract SHA256) 🔍
+Name: SHA256-Hash
+
+Input data: $exec.all_fields.data.win.eventdata.hashes
+(or the exact JSON path to your hashes field; the screenshot shows $exec.all_fields.data.win.eventdata.hashes)
+
+Regex: SHA256=([0-9A-Fa-f]{64})
+
+This captures only the 64-char SHA256 hex string (first capture group).
+
+Output: group_0 or capture[0] depending on Shuffle node naming — verify node output when you run it.
+
+If your hashes field sometimes comes with no SHA256= prefix, use a more flexible regex:
+
+ruby
+Copy code
+(?:SHA256=)?([0-9A-Fa-f]{64})
+Why: VirusTotal expects the raw hash (no SHA256=). If the node sends SHA256=... VT will return "resource not found". Strip the prefix via regex.
+
+![Screenshot](https://github.com/addula-mounika12/-SOC-Automation-Project-Wazuh-Shuffle-TheHive/blob/bd7a267380c82254692d125d687552fdfe96474b/assets/Screenshot%202025-09-28%20120753.png)
+
+### Add a VirusTotal node (v3 file lookup) 🧾
+Name: VirusTotal-v3
+
+Action: File report (GET /api/v3/files/{id})
+
+Input: the captured SHA256 from previous node (e.g. {{SHA256-Hash.group_0}} or {{exec_regex_group[0]}})
+
+Auth: x-apikey: <YOUR_VT_API_KEY> or as Shuffle VT app config depending on how you configured apps.
+
+Expected response: HTTP 200 with data.id and attributes if a record exists. If VT returns 404 or message resource not found then check captured string (no prefix, correct length).
+
+Common pitfall: Sending SHA256=61... instead of 61... will return "resource not found". Used regex above to extract clean hash.
+
+![Screenshot](https://github.com/addula-mounika12/-SOC-Automation-Project-Wazuh-Shuffle-TheHive/blob/7913ad97b907bca3880aff55ac64614cdce1af13/assets/Screenshot%202025-09-28%20121639.png)
+
+###  Add TheHive HTTP / JSON node (create case) 🐝
+Name: Create-TheHive-Case
+
+Method: POST
+
+URL: http://<THEHIVE_HOST>:9000/api/case
+
+Headers:
+
+Authorization: Bearer <THEHIVE_APIKEY>
+
+Content-Type: application/json
+
+
+
+json
+Copy code
+{
+  "description": "{{exec.title}} - automated Wazuh alert",
+  "externalLink": "{{exec.externalLink}}",
+  "flag": false,
+  "pap": 2,
+  "severity": "{{exec.severity}}",
+  "source": "{{exec.pretext}}",
+  "sourceRef": "{{exec.rule_id}}",
+  "status": "New",
+  "summary": "Mimikatz activity detected on host {{exec.text.win.system.computer}}",
+  "tags": ["T1003"],
+  "title": "{{exec.title}}",
+  "tlp": "2",
+  "type": "internal",
+  "artifacts": [
+    {"dataType": "file", "data": "{{SHA256-Hash.group_0}}"},
+    {"dataType": "string", "data": "{{exec.text.win.eventdata.Image}}"}
+  ]
+}
+
+![Screenshot](https://github.com/addula-mounika12/-SOC-Automation-Project-Wazuh-Shuffle-TheHive/blob/81c27b365d41fb8c97d8c5b9b368f54d8c77237e/assets/image.png)
+
+---
+
+### Step 6  Re-run the workflow & verify TheHive case (✔️)
+- Action: Re-run the Shuffle run (webhook triggered or re-run via UI).  
+- Verified in TheHive (account: **mydma**):
+  - Case list shows a new entry titled **"Mimikatz Usage Detected"** (Source: `WAZUH Alert`, Reference `100002`).  
+  - Clicked the case → Confirm the **Description** and **Summary** fields are populated (e.g. `Mimikatz Usage Detected` / `Mimikatz activity detected on host mona_pc`).
+![Screenshot](https://github.com/addula-mounika12/-SOC-Automation-Project-Wazuh-Shuffle-TheHive/blob/8a7f01528ff447dbd4b0add07c83f7f3cd95eba1/assets/Screenshot%202025-09-28%20142836.png)
+![Screenshot](https://github.com/addula-mounika12/-SOC-Automation-Project-Wazuh-Shuffle-TheHive/blob/a95436bbd5fb62d17d7d701390f5a6b10f699371/assets/Screenshot%202025-09-28%20142858.png)
+
+---
+
+### Step 7 — Add Email node, configure recipient, re-run and verify email (📧)
+- Action: In Shuffle workflow add an **Email** node or update existing Email node:
+ - Gave the email address 
+- Connected Email node after TheHive node (or use TheHive response to include created case id/link).
+- Re-run the workflow.
+- Verified inbox for email from Shuffle Email App with the subject and description.
+
+![Screenshot](https://github.com/addula-mounika12/-SOC-Automation-Project-Wazuh-Shuffle-TheHive/blob/58b524e8bd900f6ab129f9dc4598c8a3d6033849/assets/Screenshot%202025-09-28%20145753.png)
+![Screenshot](https://github.com/addula-mounika12/-SOC-Automation-Project-Wazuh-Shuffle-TheHive/blob/ea6a9eae7b67b035bca45a7a69c899fe3bed3bd5/assets/Screenshot%202025-09-29%20084901.png)
+
